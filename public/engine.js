@@ -7,6 +7,7 @@
 
 const CIRC = 628;          // 2*pi*r, r=100
 const COMMIT_LEAD = 0.25;  // seconds before the boundary we must lock the next clip
+const CROSSFADE = 0.012;   // seconds of overlap at each join to kill the pop
 
 let ctx = null;
 
@@ -20,6 +21,8 @@ let sectionDuration = SECTION_SECONDS;
 let pendingChoice = null;   // {idx,label} the listener locked, not yet scheduled
 let scheduled = false;      // has the NEXT section been scheduled already?
 let rafId = null;
+let currentNode = null;     // {src,gain} of the section now playing
+let nextNode = null;        // {src,gain} of the scheduled next section
 
 const bufferCache = {};
 
@@ -74,13 +77,18 @@ function preloadSection(songId, sIdx){
 }
 
 /* ---------- playback ---------- */
-function playBuffer(buffer, when){
+function playBuffer(buffer, when, crossfadeIn){
   const c = getCtx();
   const src = c.createBufferSource();
+  const gain = c.createGain();
   src.buffer = buffer;
-  src.connect(c.destination);
+  src.connect(gain).connect(c.destination);
+  if(crossfadeIn){
+    gain.gain.setValueAtTime(0, when);
+    gain.gain.linearRampToValueAtTime(1, when + CROSSFADE);
+  }
   src.start(when);
-  return src;
+  return { src, gain };
 }
 
 async function startSong(song){
@@ -106,7 +114,7 @@ async function startSong(song){
   sectionDuration = introBuf.duration;
   sectionStartTime = c.currentTime + 0.1;
   sectionEndTime = sectionStartTime + sectionDuration;
-  playBuffer(introBuf, sectionStartTime);
+  currentNode = playBuffer(introBuf, sectionStartTime, false);
   document.getElementById('now-playing').textContent = '♪ '+song.title+' — intro';
 
   preloadSection(song.id, 1);
@@ -185,11 +193,17 @@ async function scheduleNext(){
   try { buf = await getSectionBuffer(currentSong.id, currentSong.base, next, choice.idx); }
   catch(e){ document.getElementById('now-playing').textContent='⚠ '+e.message; return; }
 
-  // Start exactly at the boundary. If decode ran slightly late, clamp to now.
-  const startAt = Math.max(sectionEndTime, getCtx().currentTime);
-  playBuffer(buf, startAt);
+  // Start CROSSFADE early so the incoming clip overlaps the tail of the current one.
+  const startAt = Math.max(sectionEndTime - CROSSFADE, getCtx().currentTime);
+  const node = playBuffer(buf, startAt, true);
 
-  nextScheduledMeta = { choice, duration: buf.duration, startAt };
+  // Fade the currently-playing section down across the overlap.
+  if(currentNode && currentNode.gain){
+    currentNode.gain.gain.setValueAtTime(1, startAt);
+    currentNode.gain.gain.linearRampToValueAtTime(0, startAt + CROSSFADE);
+  }
+  nextNode = node;
+  nextScheduledMeta = { choice, duration: buf.duration, startAt: sectionEndTime };
 }
 
 // Move runtime state forward to the section that just started playing.
@@ -206,6 +220,8 @@ function advanceState(){
   document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
   document.getElementById('now-playing').textContent = '♪ now playing: '+m.choice.label.replace(' (auto)','');
 
+  currentNode = nextNode;
+  nextNode = null;
   nextScheduledMeta = null;
   preloadSection(currentSong.id, sectionIndex+1);
   offerChoice();
