@@ -76,6 +76,16 @@ function preloadSection(songId, sIdx){
   sec.options.forEach((_,cIdx)=>{ loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{}); });
 }
 
+// Same as preloadSection but WAITS for all options to finish decoding.
+async function preloadSectionAwait(songId, sIdx){
+  if(!USE_REAL_AUDIO || sIdx>=SECTIONS.length) return;
+  const sec = SECTIONS[sIdx];
+  if(!sec) return;
+  await Promise.all(sec.options.map((_,cIdx)=>
+    loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{})
+  ));
+}
+
 /* ---------- playback ---------- */
 function playBuffer(buffer, when, crossfadeIn){
   const c = getCtx();
@@ -107,9 +117,13 @@ async function startSong(song){
   document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
   document.getElementById('now-playing').textContent = 'loading…';
 
+  // Decode the intro AND all of section 1's options before we start, so the
+  // first hand-off is instant. (Later sections preload during playback.)
   let introBuf;
-  try { introBuf = await getSectionBuffer(song.id, song.base, 0, 0); }
-  catch(e){ document.getElementById('now-playing').textContent = '⚠ '+e.message; return; }
+  try {
+    introBuf = await getSectionBuffer(song.id, song.base, 0, 0);
+    await preloadSectionAwait(song.id, 1);
+  } catch(e){ document.getElementById('now-playing').textContent = '⚠ '+e.message; return; }
 
   sectionDuration = introBuf.duration;
   sectionStartTime = c.currentTime + 0.1;
@@ -223,7 +237,7 @@ function advanceState(){
   currentNode = nextNode;
   nextNode = null;
   nextScheduledMeta = null;
-  preloadSection(currentSong.id, sectionIndex+1);
+  preloadSectionAwait(currentSong.id, sectionIndex+1); // decode ahead, before its boundary
   offerChoice();
 }
 
