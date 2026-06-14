@@ -108,6 +108,12 @@ async function armNext(choiceIdx, label){
   // Pin start to the EXACT boundary. Boundary is derived in samples elsewhere.
   const node = schedule(buf, sectionEnd);
   armed = { ...node, choiceIdx, label, duration: buf.length / getCtx().sampleRate };
+  console.log('ARM | ctxRate:', getCtx().sampleRate,
+              '| now:', getCtx().currentTime.toFixed(4),
+              '| armed to start at boundary:', sectionEnd.toFixed(4),
+              '| lead:', (sectionEnd - getCtx().currentTime).toFixed(4),
+              '| clip dur:', (buf.length/getCtx().sampleRate).toFixed(4),
+              '| clip samples:', buf.length);
 }
 
 /* ---------- the per-section loop ---------- */
@@ -119,6 +125,10 @@ async function playSection(buffer, choiceLabel){
   sectionEnd   = sectionStart + sectionDur;
 
   schedule(buffer, sectionStart);
+  console.log('PLAY | start:', sectionStart.toFixed(4),
+              '| dur:', sectionDur.toFixed(4),
+              '| end(=next boundary):', sectionEnd.toFixed(4),
+              '| samples:', buffer.length);
 
   if(choiceLabel){
     chosenPath.push(choiceLabel);
