@@ -1,21 +1,26 @@
 /* ============================================================
    ENGINE — playback, scheduling, countdown, branching.
+   Schedule-ahead model: the chosen next section is queued to
+   start at the exact sample the current one ends. Seamless.
    You shouldn't need to edit this. Set things up in config.js.
    ============================================================ */
 
-const CIRC = 628; // 2*pi*r, r=100
+const CIRC = 628;          // 2*pi*r, r=100
+const COMMIT_LEAD = 0.25;  // seconds before the boundary we must lock the next clip
+
 let ctx = null;
 
 // runtime state
 let currentSong = null;
-let sectionIndex = 0;
+let sectionIndex = 0;       // index of the section currently PLAYING
 let chosenPath = [];
-let sectionEndTime = 0;
+let sectionStartTime = 0;   // ctx time the current section started
+let sectionEndTime = 0;     // ctx time the current section ends (= next section start)
 let sectionDuration = SECTION_SECONDS;
-let pendingChoice = null;
+let pendingChoice = null;   // {idx,label} the listener locked, not yet scheduled
+let scheduled = false;      // has the NEXT section been scheduled already?
 let rafId = null;
 
-// cache of decoded AudioBuffers, keyed by url
 const bufferCache = {};
 
 /* ---------- audio context ---------- */
@@ -24,14 +29,19 @@ function getCtx(){
   return ctx;
 }
 
-/* ---------- placeholder tone generator ---------- */
+/* ---------- placeholder tone generator (no fades, so the join is audible) ---------- */
 function makeToneBuffer(freq){
   const c = getCtx(), sr = c.sampleRate, len = Math.floor(SECTION_SECONDS*sr);
   const buf = c.createBuffer(1, len, sr), data = buf.getChannelData(0);
+  // tiny 5ms de-click ramp only — NOT a musical fade. Keeps the seam honest
+  // while avoiding a hard speaker pop at the raw edges.
+  const ramp = Math.floor(0.005*sr);
   for(let i=0;i<len;i++){
     const t=i/sr;
-    const env=Math.min(t*4,1)*Math.min((SECTION_SECONDS-t)*4,1);
-    data[i]=env*0.2*(Math.sin(2*Math.PI*freq*t)+0.4*Math.sin(2*Math.PI*freq*1.5*t)+0.25*Math.sin(2*Math.PI*freq*2*t));
+    let a = 0.2*(Math.sin(2*Math.PI*freq*t)+0.4*Math.sin(2*Math.PI*freq*1.5*t)+0.25*Math.sin(2*Math.PI*freq*2*t));
+    if(i<ramp) a *= i/ramp;
+    else if(i>len-ramp) a *= (len-i)/ramp;
+    data[i]=a;
   }
   return buf;
 }
@@ -48,25 +58,19 @@ async function loadBuffer(url){
   return buf;
 }
 
-// Resolve the AudioBuffer for a given section/choice, tone OR wav.
 async function getSectionBuffer(songId, base, sIdx, cIdx){
   if(!USE_REAL_AUDIO){
     return (sIdx===0) ? makeToneBuffer(base) : makeToneBuffer(freqForChoice(base,sIdx,cIdx));
   }
-  const url = (sIdx===0)
-    ? `audio/${songId}/s0.wav`
-    : `audio/${songId}/s${sIdx}_${cIdx}.wav`;
+  const url = (sIdx===0) ? `audio/${songId}/s0.wav` : `audio/${songId}/s${sIdx}_${cIdx}.wav`;
   return loadBuffer(url);
 }
 
-// Preload all option WAVs for an upcoming section (so the swap is instant).
 function preloadSection(songId, sIdx){
   if(!USE_REAL_AUDIO || sIdx>=SECTIONS.length) return;
   const sec = SECTIONS[sIdx];
   if(!sec) return;
-  sec.options.forEach((_,cIdx)=>{
-    loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{});
-  });
+  sec.options.forEach((_,cIdx)=>{ loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{}); });
 }
 
 /* ---------- playback ---------- */
@@ -87,6 +91,7 @@ async function startSong(song){
   sectionIndex = 0;
   chosenPath = [song.title];
   pendingChoice = null;
+  scheduled = false;
 
   document.getElementById('screen-start').classList.add('hidden');
   document.getElementById('screen-play').classList.remove('hidden');
@@ -94,15 +99,14 @@ async function startSong(song){
   document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
   document.getElementById('now-playing').textContent = 'loading…';
 
-  // load + play the intro
   let introBuf;
   try { introBuf = await getSectionBuffer(song.id, song.base, 0, 0); }
   catch(e){ document.getElementById('now-playing').textContent = '⚠ '+e.message; return; }
 
   sectionDuration = introBuf.duration;
-  const start = c.currentTime + 0.1;
-  playBuffer(introBuf, start);
-  sectionEndTime = start + sectionDuration;
+  sectionStartTime = c.currentTime + 0.1;
+  sectionEndTime = sectionStartTime + sectionDuration;
+  playBuffer(introBuf, sectionStartTime);
   document.getElementById('now-playing').textContent = '♪ '+song.title+' — intro';
 
   preloadSection(song.id, 1);
@@ -130,52 +134,81 @@ function offerChoice(){
 }
 
 function lockChoice(idx,label,box){
+  if(scheduled) return; // too late, next section already queued
   pendingChoice={idx,label};
   [...box.children].forEach((b,i)=>{ b.disabled=true; b.classList.add(i===idx?'picked':'locked'); });
 }
 
+/* Drives the ring AND schedules the next section ahead of the boundary. */
 function runSection(){
+  scheduled = false;
   document.getElementById('ring-cap').textContent =
     (sectionIndex+1 < SECTIONS.length) ? 'choose while it plays' : 'listen';
+
   function frame(){
-    const remain = Math.max(0, sectionEndTime - getCtx().currentTime);
+    const now = getCtx().currentTime;
+    const remain = Math.max(0, sectionEndTime - now);
     document.getElementById('ring').setAttribute('stroke-dashoffset', CIRC*(1-remain/sectionDuration));
     document.getElementById('ring-num').textContent = Math.ceil(remain);
-    if(remain <= 0.001){ commitSection(); return; }
+
+    // Once we're within COMMIT_LEAD of the end, lock in & schedule the next clip.
+    if(!scheduled && remain <= COMMIT_LEAD && sectionIndex+1 < SECTIONS.length){
+      scheduleNext(); // fire-and-forget; sets `scheduled` immediately
+    }
+
+    if(remain <= 0.001){
+      if(sectionIndex+1 >= SECTIONS.length){ finish(); return; }
+      // boundary reached: the next clip is already scheduled to start exactly now.
+      advanceState();
+      runSection();
+      return;
+    }
     rafId = requestAnimationFrame(frame);
   }
   rafId = requestAnimationFrame(frame);
 }
 
-async function commitSection(){
+// Schedule the chosen (or auto-picked) next section to start AT sectionEndTime.
+let nextScheduledMeta = null;
+async function scheduleNext(){
+  scheduled = true; // set synchronously so we never double-schedule
   const next = sectionIndex + 1;
-  if(next >= SECTIONS.length){ finish(); return; }
-
   const sec = SECTIONS[next];
+
   let choice = pendingChoice;
   if(!choice){
     const r = Math.floor(Math.random()*sec.options.length);
     choice = { idx:r, label:sec.options[r]+' (auto)' };
   }
-  sectionIndex = next;
-  pendingChoice = null;
 
   let buf;
-  try { buf = await getSectionBuffer(currentSong.id, currentSong.base, sectionIndex, choice.idx); }
+  try { buf = await getSectionBuffer(currentSong.id, currentSong.base, next, choice.idx); }
   catch(e){ document.getElementById('now-playing').textContent='⚠ '+e.message; return; }
 
-  sectionDuration = buf.duration;
-  const start = getCtx().currentTime;
-  playBuffer(buf, start);
-  sectionEndTime = start + sectionDuration;
+  // Start exactly at the boundary. If decode ran slightly late, clamp to now.
+  const startAt = Math.max(sectionEndTime, getCtx().currentTime);
+  playBuffer(buf, startAt);
 
-  chosenPath.push(choice.label);
+  nextScheduledMeta = { choice, duration: buf.duration, startAt };
+}
+
+// Move runtime state forward to the section that just started playing.
+function advanceState(){
+  const m = nextScheduledMeta;
+  sectionIndex += 1;
+  pendingChoice = null;
+
+  sectionStartTime = m.startAt;
+  sectionDuration = m.duration;
+  sectionEndTime = m.startAt + m.duration;
+
+  chosenPath.push(m.choice.label);
   document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
-  document.getElementById('now-playing').textContent = '♪ now playing: '+choice.label.replace(' (auto)','');
+  document.getElementById('now-playing').textContent = '♪ now playing: '+m.choice.label.replace(' (auto)','');
 
+  nextScheduledMeta = null;
   preloadSection(currentSong.id, sectionIndex+1);
   offerChoice();
-  runSection();
 }
 
 function finish(){
