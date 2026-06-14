@@ -60,7 +60,7 @@ async function loadBuffer(url){
 
 async function getSectionBuffer(songId, base, sIdx, cIdx){
   if(!USE_REAL_AUDIO){
-    git add -A && git commit -m "same-tone seam test" && git push
+    return makeToneBuffer(220); // TEST: same tone every section to check seam continuity
   }
   const url = (sIdx===0) ? `audio/${songId}/s0.wav` : `audio/${songId}/s${sIdx}_${cIdx}.wav`;
   return loadBuffer(url);
