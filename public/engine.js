@@ -63,9 +63,9 @@ async function loadBuffer(url){
 
 async function getSectionBuffer(songId, base, sIdx, cIdx){
   if(!USE_REAL_AUDIO){
-    return makeToneBuffer(220); // TEST: same tone every section to check seam continuity
+    return (sIdx===0) ? makeToneBuffer(base) : makeToneBuffer(freqForChoice(base,sIdx,cIdx));
   }
-  const url = (sIdx===0) ? `audio/${songId}/s0.wav` : `audio/${songId}/s${sIdx}_${cIdx}.wav`;
+  const url = (sIdx===0) ? `audio/${songId}/s0.mp3` : `audio/${songId}/s${sIdx}_${cIdx}.mp3`;
   return loadBuffer(url);
 }
 
@@ -73,7 +73,7 @@ function preloadSection(songId, sIdx){
   if(!USE_REAL_AUDIO || sIdx>=SECTIONS.length) return;
   const sec = SECTIONS[sIdx];
   if(!sec) return;
-  sec.options.forEach((_,cIdx)=>{ loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{}); });
+  sec.options.forEach((_,cIdx)=>{ loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.mp3`).catch(()=>{}); });
 }
 
 /* ---------- playback ---------- */

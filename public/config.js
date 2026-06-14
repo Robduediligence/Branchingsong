@@ -4,7 +4,7 @@
 
 // FLIP THIS to true once you've added real WAV files to /audio/.
 // Leave false to hear placeholder tones (good for testing layout/flow).
-const USE_REAL_AUDIO = false;
+const USE_REAL_AUDIO = true;
 
 // How long each section lasts, in seconds. With real audio this is
 // auto-detected from each WAV's duration, so it only matters for tones.
