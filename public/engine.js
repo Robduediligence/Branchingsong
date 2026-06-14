@@ -1,56 +1,60 @@
 /* ============================================================
-   ENGINE — playback, scheduling, countdown, branching.
-   Schedule-ahead model: the chosen next section is queued to
-   start at the exact sample the current one ends. Seamless.
-   You shouldn't need to edit this. Set things up in config.js.
+   ENGINE v2 — DAW-style gapless playback.
+   - AudioContext locked to 44100 so WAVs are never resampled
+     (buffer.length stays sample-exact).
+   - Each section's start is chained off the PREVIOUS section's
+     start + its exact sample length. No per-clip rounding drift.
+   - "Arm-ahead": when a section starts, the DEFAULT next clip is
+     immediately scheduled to fire at the exact boundary. If the
+     listener picks before the commit cutoff, we cancel the armed
+     source and arm their choice instead. Something is always armed,
+     so there is never a decode-on-demand gap.
    ============================================================ */
 
 const CIRC = 628;          // 2*pi*r, r=100
-const COMMIT_LEAD = 0.25;  // seconds before the boundary we must lock the next clip
-const CROSSFADE = 0.012;   // seconds of overlap at each join to kill the pop
+const COMMIT_LEAD = 0.12;  // must (re)arm at least this many seconds before the boundary
 
 let ctx = null;
 
-// runtime state
-let currentSong = null;
-let sectionIndex = 0;       // index of the section currently PLAYING
-let chosenPath = [];
-let sectionStartTime = 0;   // ctx time the current section started
-let sectionEndTime = 0;     // ctx time the current section ends (= next section start)
-let sectionDuration = SECTION_SECONDS;
-let pendingChoice = null;   // {idx,label} the listener locked, not yet scheduled
-let scheduled = false;      // has the NEXT section been scheduled already?
-let rafId = null;
-let currentNode = null;     // {src,gain} of the section now playing
-let nextNode = null;        // {src,gain} of the scheduled next section
+/* ---------- runtime state ---------- */
+let currentSong   = null;
+let sectionIndex  = 0;      // section currently PLAYING
+let chosenPath    = [];
+let sectionStart  = 0;      // ctx-time the current section started
+let sectionEnd    = 0;      // ctx-time it ends (= next section's exact start)
+let sectionDur    = 1;      // current section duration (seconds), from samples
+let rafId         = null;
+
+let armed         = null;   // { src, gain, choiceIdx, label, duration } scheduled for the boundary
+let committed     = false;  // true once we're inside COMMIT_LEAD (armed clip is locked in)
 
 const bufferCache = {};
 
-/* ---------- audio context ---------- */
+/* ---------- audio context (locked sample rate) ---------- */
 function getCtx(){
-  if(!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if(!ctx){
+    try { ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 }); }
+    catch(e){ ctx = new (window.AudioContext || window.webkitAudioContext)(); }
+  }
   return ctx;
 }
 
-/* ---------- placeholder tone generator (no fades, so the join is audible) ---------- */
+/* ---------- placeholder tone (only used when USE_REAL_AUDIO is false) ---------- */
 function makeToneBuffer(freq){
   const c = getCtx(), sr = c.sampleRate, len = Math.floor(SECTION_SECONDS*sr);
   const buf = c.createBuffer(1, len, sr), data = buf.getChannelData(0);
-  // tiny 5ms de-click ramp only — NOT a musical fade. Keeps the seam honest
-  // while avoiding a hard speaker pop at the raw edges.
   const ramp = Math.floor(0.005*sr);
   for(let i=0;i<len;i++){
     const t=i/sr;
     let a = 0.2*(Math.sin(2*Math.PI*freq*t)+0.4*Math.sin(2*Math.PI*freq*1.5*t)+0.25*Math.sin(2*Math.PI*freq*2*t));
-    if(i<ramp) a *= i/ramp;
-    else if(i>len-ramp) a *= (len-i)/ramp;
+    if(i<ramp) a*=i/ramp; else if(i>len-ramp) a*=(len-i)/ramp;
     data[i]=a;
   }
   return buf;
 }
 function freqForChoice(base,sIdx,cIdx){ return base*Math.pow(2,(sIdx+cIdx*0.12)/12); }
 
-/* ---------- real WAV loader (fetch + decode, cached) ---------- */
+/* ---------- loading ---------- */
 async function loadBuffer(url){
   if(bufferCache[url]) return bufferCache[url];
   const res = await fetch(url);
@@ -60,45 +64,150 @@ async function loadBuffer(url){
   bufferCache[url] = buf;
   return buf;
 }
-
-async function getSectionBuffer(songId, base, sIdx, cIdx){
+function urlFor(songId, sIdx, cIdx){
+  return (sIdx===0) ? `audio/${songId}/s0.wav` : `audio/${songId}/s${sIdx}_${cIdx}.wav`;
+}
+async function getBuffer(songId, base, sIdx, cIdx){
   if(!USE_REAL_AUDIO){
     return (sIdx===0) ? makeToneBuffer(base) : makeToneBuffer(freqForChoice(base,sIdx,cIdx));
   }
-  const url = (sIdx===0) ? `audio/${songId}/s0.wav` : `audio/${songId}/s${sIdx}_${cIdx}.wav`;
-  return loadBuffer(url);
+  return loadBuffer(urlFor(songId, sIdx, cIdx));
+}
+// Decode ALL options for a section and wait — so arming is instant later.
+async function preloadAwait(songId, sIdx){
+  if(!USE_REAL_AUDIO || sIdx<=0 || sIdx>=SECTIONS.length) return;
+  const sec = SECTIONS[sIdx]; if(!sec) return;
+  await Promise.all(sec.options.map((_,c)=> loadBuffer(urlFor(songId,sIdx,c)).catch(()=>{}) ));
 }
 
-function preloadSection(songId, sIdx){
-  if(!USE_REAL_AUDIO || sIdx>=SECTIONS.length) return;
-  const sec = SECTIONS[sIdx];
-  if(!sec) return;
-  sec.options.forEach((_,cIdx)=>{ loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{}); });
-}
-
-// Same as preloadSection but WAITS for all options to finish decoding.
-async function preloadSectionAwait(songId, sIdx){
-  if(!USE_REAL_AUDIO || sIdx>=SECTIONS.length) return;
-  const sec = SECTIONS[sIdx];
-  if(!sec) return;
-  await Promise.all(sec.options.map((_,cIdx)=>
-    loadBuffer(`audio/${songId}/s${sIdx}_${cIdx}.wav`).catch(()=>{})
-  ));
-}
-
-/* ---------- playback ---------- */
-function playBuffer(buffer, when, crossfadeIn){
+/* ---------- scheduling primitive ---------- */
+// Schedule a buffer to begin exactly at ctx-time `when`. Returns the node.
+function schedule(buffer, when){
   const c = getCtx();
   const src = c.createBufferSource();
   const gain = c.createGain();
   src.buffer = buffer;
   src.connect(gain).connect(c.destination);
-  if(crossfadeIn){
-    gain.gain.setValueAtTime(0, when);
-    gain.gain.linearRampToValueAtTime(1, when + CROSSFADE);
-  }
-  src.start(when);
+  src.start(when);              // sample-accurate against the audio clock
   return { src, gain };
+}
+
+/* ---------- arming the next section ---------- */
+// Arm `choiceIdx` to fire at the boundary. Cancels any previously-armed clip.
+async function armNext(choiceIdx, label){
+  const next = sectionIndex + 1;
+  if(next >= SECTIONS.length) return;
+
+  let buf;
+  try { buf = await getBuffer(currentSong.id, currentSong.base, next, choiceIdx); }
+  catch(e){ document.getElementById('now-playing').textContent='⚠ '+e.message; return; }
+
+  // Cancel a previously armed source (listener changed their mind in time).
+  if(armed && armed.src){ try { armed.src.stop(); } catch(_){} }
+
+  // Pin start to the EXACT boundary. Boundary is derived in samples elsewhere.
+  const node = schedule(buf, sectionEnd);
+  armed = { ...node, choiceIdx, label, duration: buf.length / getCtx().sampleRate };
+}
+
+/* ---------- the per-section loop ---------- */
+async function playSection(buffer, choiceLabel){
+  const c = getCtx();
+  // start time: chained off previous boundary (sample-exact) or now for the intro
+  sectionStart = (sectionEnd > c.currentTime) ? sectionEnd : c.currentTime + 0.08;
+  sectionDur   = buffer.length / c.sampleRate;       // EXACT, from samples
+  sectionEnd   = sectionStart + sectionDur;
+
+  schedule(buffer, sectionStart);
+
+  if(choiceLabel){
+    chosenPath.push(choiceLabel);
+    document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
+    document.getElementById('now-playing').textContent = '♪ '+choiceLabel.replace(' (auto)','');
+  }
+
+  committed = false;
+  armed = null;
+
+  // Decode the next section's options, then arm the DEFAULT immediately.
+  await preloadAwait(currentSong.id, sectionIndex+1);
+  if(sectionIndex+1 < SECTIONS.length){
+    await armNext(0, SECTIONS[sectionIndex+1].options[0] + ' (auto)');
+  }
+
+  offerChoice();
+  runCountdown();
+}
+
+function offerChoice(){
+  const next = sectionIndex + 1;
+  const box = document.getElementById('next-choices');
+  if(next >= SECTIONS.length){
+    box.innerHTML=''; document.getElementById('prompt').textContent='Final section playing…'; return;
+  }
+  const sec = SECTIONS[next];
+  document.getElementById('prompt').textContent = sec.prompt;
+  box.innerHTML='';
+  sec.options.forEach((label,idx)=>{
+    const b=document.createElement('button');
+    b.className='choice'; b.textContent=label;
+    b.onclick=()=>pick(idx,label,box);
+    box.appendChild(b);
+  });
+}
+
+// Listener picks: re-arm with their choice if we haven't committed yet.
+function pick(idx,label,box){
+  if(committed) return;            // too close to the boundary; armed default will play
+  [...box.children].forEach((b,i)=>{ b.disabled=true; b.classList.add(i===idx?'picked':'locked'); });
+  armNext(idx, label);
+}
+
+function runCountdown(){
+  document.getElementById('ring-cap').textContent =
+    (sectionIndex+1 < SECTIONS.length) ? 'choose while it plays' : 'listen';
+  function frame(){
+    const now = getCtx().currentTime;
+    const remain = Math.max(0, sectionEnd - now);
+    document.getElementById('ring').setAttribute('stroke-dashoffset', CIRC*(1-remain/sectionDur));
+    document.getElementById('ring-num').textContent = Math.ceil(remain);
+
+    if(!committed && remain <= COMMIT_LEAD) committed = true; // lock the armed clip
+
+    if(remain <= 0.001){
+      if(sectionIndex+1 >= SECTIONS.length){ finish(); return; }
+      // boundary: the armed source is already sounding. Adopt it as current.
+      const a = armed;
+      sectionIndex += 1;
+      // its start was sectionEnd; recompute our timeline anchors from it
+      sectionStart = sectionEnd;
+      sectionDur   = a.duration;
+      sectionEnd   = sectionStart + sectionDur;
+      armed = null;
+
+      chosenPath.push(a.label);
+      document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
+      document.getElementById('now-playing').textContent = '♪ '+a.label.replace(' (auto)','');
+
+      // prep the section AFTER this one
+      continueAfterBoundary();
+      return;
+    }
+    rafId = requestAnimationFrame(frame);
+  }
+  rafId = requestAnimationFrame(frame);
+}
+
+// After a boundary is crossed: decode next options and arm the new default.
+async function continueAfterBoundary(){
+  committed = false;
+  armed = null;
+  await preloadAwait(currentSong.id, sectionIndex+1);
+  if(sectionIndex+1 < SECTIONS.length){
+    await armNext(0, SECTIONS[sectionIndex+1].options[0] + ' (auto)');
+  }
+  offerChoice();
+  runCountdown();
 }
 
 async function startSong(song){
@@ -108,8 +217,8 @@ async function startSong(song){
   currentSong = song;
   sectionIndex = 0;
   chosenPath = [song.title];
-  pendingChoice = null;
-  scheduled = false;
+  armed = null; committed = false;
+  sectionEnd = 0;
 
   document.getElementById('screen-start').classList.add('hidden');
   document.getElementById('screen-play').classList.remove('hidden');
@@ -117,128 +226,14 @@ async function startSong(song){
   document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
   document.getElementById('now-playing').textContent = 'loading…';
 
-  // Decode the intro AND all of section 1's options before we start, so the
-  // first hand-off is instant. (Later sections preload during playback.)
-  let introBuf;
+  let intro;
   try {
-    introBuf = await getSectionBuffer(song.id, song.base, 0, 0);
-    await preloadSectionAwait(song.id, 1);
+    intro = await getBuffer(song.id, song.base, 0, 0);
+    await preloadAwait(song.id, 1);   // section 1 ready before we start
   } catch(e){ document.getElementById('now-playing').textContent = '⚠ '+e.message; return; }
 
-  sectionDuration = introBuf.duration;
-  sectionStartTime = c.currentTime + 0.1;
-  sectionEndTime = sectionStartTime + sectionDuration;
-  currentNode = playBuffer(introBuf, sectionStartTime, false);
   document.getElementById('now-playing').textContent = '♪ '+song.title+' — intro';
-
-  preloadSection(song.id, 1);
-  offerChoice();
-  runSection();
-}
-
-function offerChoice(){
-  const next = sectionIndex + 1;
-  const box = document.getElementById('next-choices');
-  if(next >= SECTIONS.length){
-    box.innerHTML='';
-    document.getElementById('prompt').textContent='Final section playing…';
-    return;
-  }
-  const sec = SECTIONS[next];
-  document.getElementById('prompt').textContent = sec.prompt;
-  box.innerHTML='';
-  sec.options.forEach((label,idx)=>{
-    const b=document.createElement('button');
-    b.className='choice'; b.textContent=label;
-    b.onclick=()=>lockChoice(idx,label,box);
-    box.appendChild(b);
-  });
-}
-
-function lockChoice(idx,label,box){
-  if(scheduled) return; // too late, next section already queued
-  pendingChoice={idx,label};
-  [...box.children].forEach((b,i)=>{ b.disabled=true; b.classList.add(i===idx?'picked':'locked'); });
-}
-
-/* Drives the ring AND schedules the next section ahead of the boundary. */
-function runSection(){
-  scheduled = false;
-  document.getElementById('ring-cap').textContent =
-    (sectionIndex+1 < SECTIONS.length) ? 'choose while it plays' : 'listen';
-
-  function frame(){
-    const now = getCtx().currentTime;
-    const remain = Math.max(0, sectionEndTime - now);
-    document.getElementById('ring').setAttribute('stroke-dashoffset', CIRC*(1-remain/sectionDuration));
-    document.getElementById('ring-num').textContent = Math.ceil(remain);
-
-    // Once we're within COMMIT_LEAD of the end, lock in & schedule the next clip.
-    if(!scheduled && remain <= COMMIT_LEAD && sectionIndex+1 < SECTIONS.length){
-      scheduleNext(); // fire-and-forget; sets `scheduled` immediately
-    }
-
-    if(remain <= 0.001){
-      if(sectionIndex+1 >= SECTIONS.length){ finish(); return; }
-      // boundary reached: the next clip is already scheduled to start exactly now.
-      advanceState();
-      runSection();
-      return;
-    }
-    rafId = requestAnimationFrame(frame);
-  }
-  rafId = requestAnimationFrame(frame);
-}
-
-// Schedule the chosen (or auto-picked) next section to start AT sectionEndTime.
-let nextScheduledMeta = null;
-async function scheduleNext(){
-  scheduled = true; // set synchronously so we never double-schedule
-  const next = sectionIndex + 1;
-  const sec = SECTIONS[next];
-
-  let choice = pendingChoice;
-  if(!choice){
-    const r = Math.floor(Math.random()*sec.options.length);
-    choice = { idx:r, label:sec.options[r]+' (auto)' };
-  }
-
-  let buf;
-  try { buf = await getSectionBuffer(currentSong.id, currentSong.base, next, choice.idx); }
-  catch(e){ document.getElementById('now-playing').textContent='⚠ '+e.message; return; }
-
-  // Start CROSSFADE early so the incoming clip overlaps the tail of the current one.
-  const startAt = Math.max(sectionEndTime - CROSSFADE, getCtx().currentTime);
-  const node = playBuffer(buf, startAt, true);
-
-  // Fade the currently-playing section down across the overlap.
-  if(currentNode && currentNode.gain){
-    currentNode.gain.gain.setValueAtTime(1, startAt);
-    currentNode.gain.gain.linearRampToValueAtTime(0, startAt + CROSSFADE);
-  }
-  nextNode = node;
-  nextScheduledMeta = { choice, duration: buf.duration, startAt: sectionEndTime };
-}
-
-// Move runtime state forward to the section that just started playing.
-function advanceState(){
-  const m = nextScheduledMeta;
-  sectionIndex += 1;
-  pendingChoice = null;
-
-  sectionStartTime = m.startAt;
-  sectionDuration = m.duration;
-  sectionEndTime = m.startAt + m.duration;
-
-  chosenPath.push(m.choice.label);
-  document.getElementById('path-trace').textContent = chosenPath.join('  →  ');
-  document.getElementById('now-playing').textContent = '♪ now playing: '+m.choice.label.replace(' (auto)','');
-
-  currentNode = nextNode;
-  nextNode = null;
-  nextScheduledMeta = null;
-  preloadSectionAwait(currentSong.id, sectionIndex+1); // decode ahead, before its boundary
-  offerChoice();
+  await playSection(intro, null);
 }
 
 function finish(){
@@ -252,7 +247,7 @@ function finish(){
   document.getElementById('restart').classList.remove('hidden');
 }
 
-/* ---------- wire up start screen ---------- */
+/* ---------- start screen ---------- */
 const list = document.getElementById('song-list');
 SONGS.forEach(song=>{
   const b=document.createElement('button');
