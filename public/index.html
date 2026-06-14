@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pick Your Path</title>
+<style>
+  :root { --espresso:#3B2B23; --gold:#C89B5A; --sage:#7F9C8B; --bg:#1a1410; --ink:#f3ece2; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:'Cormorant Garamond',Georgia,serif; background:radial-gradient(circle at 50% 30%,#2a2018,var(--bg)); color:var(--ink); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .stage { width:100%; max-width:560px; text-align:center; }
+  h1 { font-family:'Cinzel',serif; letter-spacing:3px; font-weight:600; color:var(--gold); font-size:1.6rem; margin-bottom:8px; text-transform:uppercase; }
+  .sub { color:var(--sage); font-size:1.05rem; margin-bottom:28px; font-style:italic; }
+  .choices { display:flex; flex-direction:column; gap:12px; }
+  button.choice { background:rgba(200,155,90,0.08); border:1px solid rgba(200,155,90,0.35); color:var(--ink); padding:16px 20px; font-family:inherit; font-size:1.15rem; border-radius:10px; cursor:pointer; transition:all .25s; letter-spacing:.5px; }
+  button.choice:hover:not(:disabled) { background:rgba(200,155,90,0.22); border-color:var(--gold); transform:translateY(-2px); }
+  button.choice.picked { background:var(--gold); color:var(--espresso); font-weight:600; }
+  button.choice.locked { opacity:.3; cursor:default; }
+  button.choice:disabled { cursor:default; transform:none; }
+  .ring-wrap { position:relative; width:220px; height:220px; margin:0 auto 24px; }
+  svg { transform:rotate(-90deg); }
+  .ring-bg { stroke:rgba(255,255,255,0.08); }
+  .ring-fg { stroke:var(--sage); stroke-linecap:round; }
+  .ring-label { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  .ring-num { font-family:'Cinzel',serif; font-size:2.4rem; color:var(--gold); }
+  .ring-cap { color:var(--sage); font-size:.8rem; letter-spacing:2px; text-transform:uppercase; }
+  .now-playing { color:var(--sage); font-style:italic; margin-bottom:20px; min-height:24px; }
+  .path-trace { margin-top:28px; color:rgba(243,236,226,0.5); font-size:.95rem; font-style:italic; }
+  .restart { margin-top:24px; background:none; border:1px solid var(--sage); color:var(--sage); padding:10px 22px; border-radius:8px; cursor:pointer; font-family:inherit; letter-spacing:1px; }
+  .hidden { display:none; }
+  .loading { color:var(--gold); font-style:italic; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div id="screen-start">
+    <h1>Choose Your Song</h1>
+    <p class="sub">Each meaning takes the song somewhere different.</p>
+    <div class="choices" id="song-list"></div>
+  </div>
+  <div id="screen-play" class="hidden">
+    <div class="ring-wrap">
+      <svg width="220" height="220" viewBox="0 0 220 220">
+        <circle class="ring-bg" cx="110" cy="110" r="100" fill="none" stroke-width="10"/>
+        <circle id="ring" class="ring-fg" cx="110" cy="110" r="100" fill="none" stroke-width="10" stroke-dasharray="628" stroke-dashoffset="0"/>
+      </svg>
+      <div class="ring-label">
+        <div class="ring-num" id="ring-num">—</div>
+        <div class="ring-cap" id="ring-cap">listen</div>
+      </div>
+    </div>
+    <p class="now-playing" id="now-playing"></p>
+    <h1 id="prompt">Where does it go next?</h1>
+    <div class="choices" id="next-choices"></div>
+    <p class="path-trace" id="path-trace"></p>
+    <button class="restart hidden" id="restart">↺ Start over</button>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script src="engine.js"></script>
+</body>
+</html>
